@@ -144,6 +144,8 @@
       const a = Strategy.trendAt(d.ctx.d1, t), b = Strategy.trendAt(d.ctx.h4, t);
       sg.d1 = a ? (a.st === sg.side ? "同向" : "逆向") : null;
       sg.h4 = b ? (b.st === sg.side ? "同向" : "逆向") : null;
+      const hist = d.res.ind.macd.hist;
+      sg.mt = (hist[sg.i] - hist[sg.i - 1]) * sg.side > 0 ? "是" : "否"; // MACD 柱是否朝信号方向拐头
     }
     recordJournal(sym, d.res.signals);
     d.live = Strategy.liveState(d.res, d.ltf);
@@ -162,7 +164,7 @@
       if (sg.r == null || !sg.d1 || !sg.h4) continue;
       const key = `${sym}|${sg.time}`;
       if (journal[key]) continue;
-      journal[key] = { sym, t: sg.time, side: sg.side, r: +sg.r.toFixed(3), d1: sg.d1, h4: sg.h4 };
+      journal[key] = { sym, t: sg.time, side: sg.side, r: +sg.r.toFixed(3), d1: sg.d1, h4: sg.h4, mt: sg.mt, tg: sg.trigger };
       journalDirty = true;
     }
   }
@@ -354,6 +356,13 @@
       autoSize: true,
     });
     candle = chart.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350" });
+    // 鼠标悬停 / 手指点按某根K线时显示它的高低点和涨跌幅
+    chart.subscribeCrosshairMove((param) => {
+      const d = state.data[state.active];
+      if (!d?.ltf?.length) return;
+      hoverIdx = param.time != null ? d.ltf.findIndex((x) => x.time + TZ === param.time) : -1;
+      renderOhlc();
+    });
     vol = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false });
     chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
     candle.priceScale().applyOptions({ scaleMargins: { top: 0.05, bottom: 0.18 } });
@@ -396,6 +405,26 @@
     const last = d.res.signals[d.res.signals.length - 1];
     return `${state.active}|${d.ltf.length}|${d.res.signals.length}|${last?.result}|${last?.trailSl}|${d.lastStatus?.code}`;
   };
+
+  // K线信息条：开高低收、涨跌幅（相对上一根收盘）、振幅（最高最低差 / 上一根收盘）
+  let hoverIdx = -1;
+  function renderOhlc() {
+    const d = state.data[state.active];
+    if (!d?.ltf?.length) return;
+    const k = d.ltf, i = hoverIdx >= 0 && hoverIdx < k.length ? hoverIdx : k.length - 1;
+    const x = k[i], prevClose = i > 0 ? k[i - 1].close : x.open;
+    const chg = ((x.close - prevClose) / prevClose) * 100, amp = ((x.high - x.low) / prevClose) * 100;
+    const cls = chg >= 0 ? "long" : "short";
+    const vol = x.volume >= 1e6 ? (x.volume / 1e6).toFixed(2) + "M" : x.volume >= 1e3 ? (x.volume / 1e3).toFixed(1) + "K" : x.volume.toFixed(0);
+    setHtml("ohlc", `<span>${fmtTime(x.time)}${i === k.length - 1 ? ' <span class="hover">最新</span>' : ""}</span>
+      <span><span class="k">开</span>${fmtPrice(x.open)}</span>
+      <span><span class="k">高</span><span class="long">${fmtPrice(x.high)}</span></span>
+      <span><span class="k">低</span><span class="short">${fmtPrice(x.low)}</span></span>
+      <span><span class="k">收</span><span class="${cls}">${fmtPrice(x.close)}</span></span>
+      <span><span class="k">涨跌</span><span class="${cls}">${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%</span></span>
+      <span><span class="k">振幅</span>${amp.toFixed(2)}%</span>
+      <span><span class="k">量</span>${vol}</span>`);
+  }
 
   function renderChart() {
     const sym = state.active, d = state.data[sym];
@@ -461,6 +490,7 @@
       chartSym = sym;
     }
     chartKey = chartKeyOf(d);
+    renderOhlc();
   }
 
   // ---------------- 面板渲染 ----------------
@@ -635,9 +665,13 @@
         <span>日线 逆向</span>${grp((x) => x.d1 === "逆向")}
         <span>4h 同向</span>${grp((x) => x.h4 === "同向")}
         <span>4h 逆向</span>${grp((x) => x.h4 === "逆向")}
+        <span>MACD柱已拐头</span>${grp((x) => x.mt === "是")}
+        <span>MACD柱未拐头</span>${grp((x) => x.mt === "否")}
+        <span>回踩确认</span>${grp((x) => x.tg === "回踩确认")}
+        <span>放量突破/跌破</span>${grp((x) => x.tg && x.tg !== "回踩确认")}
         <span>全部</span>${grp(() => true)}
       </div>
-      <div class="bt-note">全部品种、本机自 ${since} 起累计（已扣费）。每组积累到 200 笔以上，差距仍然稳定，再考虑把它加入过滤条件。</div>`);
+      <div class="bt-note">全部品种、本机自 ${since} 起累计（已扣费）。6 个月回测里「MACD柱已拐头」每笔略好、「4h 同向」略差，但差距都在统计误差内。每组积累到 200 笔以上、差距仍然稳定，再考虑改规则。</div>`);
 
     const bt = d.res.bt, pct = (x) => (isNaN(x) ? "-" : (x * 100).toFixed(0) + "%");
     $("btRange").textContent = `（近 ${Math.round((d.ltf.length * 15) / 60 / 24)} 天 · ${bt.total} 笔）`;
@@ -666,6 +700,7 @@
 
   function selectSymbol(sym) {
     state.active = sym;
+    hoverIdx = -1;
     renderAll();
     if (matchMedia("(max-width: 900px)").matches) $("chartSection").scrollIntoView({ behavior: "smooth" });
   }
@@ -821,6 +856,7 @@
         // 只更新最后一根，避免整图重绘
         const x = d.ltf[d.ltf.length - 1], T = x.time + TZ;
         candle.update({ time: T, open: x.open, high: x.high, low: x.low, close: x.close });
+        renderOhlc();
         vol.update({ time: T, value: x.volume, color: x.close >= x.open ? "rgba(38,166,154,.35)" : "rgba(239,83,80,.35)" });
       }
     }, 1000);

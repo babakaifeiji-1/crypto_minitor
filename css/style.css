@@ -85,6 +85,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .legend { display: flex; gap: 12px; font-size: 11px; color: var(--muted); }
 .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 3px; }
 .chart { flex: 1; min-height: 0; }
+.ohlc { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 4px 12px; font-size: 12px; border-bottom: 1px solid var(--line); min-height: 26px; align-items: center; }
+.ohlc .k { color: var(--muted); margin-right: 3px; }
+.ohlc .hover { color: var(--accent); font-size: 11px; }
 .indicator-bar { display: flex; gap: 18px; padding: 6px 12px; border-top: 1px solid var(--line); font-size: 12px; flex-wrap: wrap; }
 .indicator-bar span b { margin-left: 4px; }
 
