@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0e1117" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="盯盘助手" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <title>盯盘助手 · 15m 趋势跟随</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">盯盘助手 <span class="sub">15m 信号 · 1h 方向过滤</span></div>
+    <button id="menuBtn" class="btn menu-btn">⚙️ 设置</button>
+    <div class="controls">
+      <label title="共振分数达到该值才发出信号。越高信号越少，胜率越高">
+        信号阈值 <input type="range" id="threshold" min="45" max="90" step="5" /> <b id="thresholdVal"></b>
+      </label>
+      <label title="回测用的双边手续费（开+平），按你的VIP等级填写">
+        手续费 <input type="number" id="feePct" min="0" max="0.2" step="0.01" style="width:58px" />%
+      </label>
+      <label title="只做与1小时趋势同方向的单"><input type="checkbox" id="strictHtf" /> 严格顺大势</label>
+      <button id="soundBtn" class="btn">🔇 点击开启声音</button>
+      <button id="pushBtn" class="btn">📱 手机推送</button>
+      <form id="addForm" class="add-form">
+        <input id="addInput" list="hotList" placeholder="添加合约 / 选热门美股" autocomplete="off" />
+        <datalist id="hotList"></datalist>
+        <button class="btn" type="submit">添加</button>
+      </form>
+    </div>
+    <span id="conn" class="conn"><i></i><span>连接中</span></span>
+  </header>
+
+  <main class="layout">
+    <aside class="watchlist" id="watchlist"></aside>
+
+    <section class="center" id="chartSection">
+      <div class="chart-head">
+        <div id="chartTitle" class="chart-title"></div>
+        <div class="legend">
+          <span><i style="background:#f5c542"></i>EMA9</span>
+          <span><i style="background:#4c8dff"></i>EMA21</span>
+          <span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>
+          <span class="muted">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 日线位</span>
+        </div>
+      </div>
+      <div id="chart" class="chart"></div>
+      <div id="indicatorBar" class="indicator-bar"></div>
+    </section>
+
+    <aside class="side">
+      <div class="panel">
+        <h3>最新信号 · 操作建议</h3>
+        <div id="lastSignal"></div>
+      </div>
+      <div class="panel">
+        <h3>大周期背景 <span class="muted small">（日线 / 4h，仅参考）</span></h3>
+        <div id="bigPicture"></div>
+      </div>
+      <div class="panel">
+        <h3>关键价位 <span class="muted small">（15m / 1h 支撑压力）</span></h3>
+        <div id="keyLevels"></div>
+      </div>
+      <div class="panel">
+        <h3>实时共振 <span class="muted small">（含未收盘K线）</span></h3>
+        <div id="liveScore"></div>
+      </div>
+      <div class="panel">
+        <h3>历史回测 <span class="muted small" id="btRange"></span></h3>
+        <div id="backtest"></div>
+      </div>
+      <div class="panel">
+        <h3>大周期分组统计</h3>
+        <div id="ctxStats"></div>
+      </div>
+      <div class="panel grow">
+        <h3>事件记录 <span class="muted small">（全部品种，本次打开后）</span></h3>
+        <div id="feed" class="feed"></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toasts" class="toasts"></div>
+
+  <div id="pushModal" class="modal">
+    <div class="modal-box">
+      <div class="modal-head"><b>📱 Telegram 手机推送</b><span id="pClose" class="close">✕</span></div>
+      <ol class="steps">
+        <li>在 Telegram 搜索 <b>@BotFather</b>，发送 <code>/newbot</code>，按提示起个名字，拿到 <b>Bot Token</b></li>
+        <li>把 Token 填到下面，然后在 Telegram 里<b>给你的新机器人随便发一句话</b></li>
+        <li>点「自动获取」拿到 Chat ID，再点「发送测试」</li>
+      </ol>
+      <label class="field">Bot Token<input id="pTok" placeholder="123456789:AAxxxxxxxx" autocomplete="off" /></label>
+      <label class="field">Chat ID
+        <span class="field-row"><input id="pChat" placeholder="点右边自动获取" autocomplete="off" /><button id="pDetect" class="btn">自动获取</button></span>
+      </label>
+      <label class="field">看板网址（可选，消息里会附上，点开直接看图）<input id="pUrl" placeholder="部署后的网址，例如 https://xxx.github.io/trade-monitor/" autocomplete="off" /></label>
+      <div class="field">推送哪些事件
+        <div class="ev-list">
+          <label><input type="checkbox" data-ev="signal" /> 新信号</label>
+          <label><input type="checkbox" data-ev="weak" /> 信号走弱</label>
+          <label><input type="checkbox" data-ev="tp1" /> 到达 TP1</label>
+          <label><input type="checkbox" data-ev="close" /> 单子结束</label>
+          <label><input type="checkbox" data-ev="exit" /> 趋势转弱</label>
+          <label><input type="checkbox" data-ev="health" /> 启动 / 断线 / 睡眠</label>
+        </div>
+      </div>
+      <label class="enable"><input type="checkbox" id="pEnabled" /> <b>由这台设备负责推送</b><br>
+        <span class="muted small">只在家里那台常开的电脑上勾选。手机上不要勾，否则会收到重复消息。</span></label>
+      <div class="modal-foot">
+        <span id="pMsg"></span>
+        <button id="pTest" class="btn">发送测试</button>
+        <button id="pSave" class="btn on">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/vendor/lightweight-charts.js"></script>
+  <script src="js/indicators.js"></script>
+  <script src="js/levels.js"></script>
+  <script src="js/strategy.js"></script>
+  <script src="js/push.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
