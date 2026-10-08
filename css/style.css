@@ -179,3 +179,7 @@ code { background: var(--bg); padding: 0 4px; border-radius: 3px; }
   .toast { width: auto; }
   .tf-line { grid-template-columns: 34px 1fr 1fr 1.3fr; font-size: 11px; }
 }
+.flow-grid { grid-template-columns: 1.4fr 1fr 1fr 1fr; }
+.lv-strong { font-weight: 700; }
+.lv-strong .num:first-of-type { text-decoration: underline; text-underline-offset: 3px; }
+.lv-weak { opacity: .55; }

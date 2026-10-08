@@ -47,7 +47,7 @@
           <span><i style="background:#f5c542"></i>EMA9</span>
           <span><i style="background:#4c8dff"></i>EMA21</span>
           <span><i style="background:#26a69a"></i>/<i style="background:#ef5350"></i>Supertrend</span>
-          <span class="muted">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 日线位</span>
+          <span class="muted">▲▼ 信号 · ● 趋势转弱 · 红/绿 压力/支撑 · 紫 日线位 · 🧱 强价位被拒</span>
         </div>
       </div>
       <div id="ohlc" class="ohlc num"></div>
@@ -59,6 +59,10 @@
       <div class="panel">
         <h3>最新信号 · 操作建议</h3>
         <div id="lastSignal"></div>
+      </div>
+      <div class="panel" id="flowPanel" style="display:none">
+        <h3>合约资金面 <span class="muted small">（仅加密货币）</span></h3>
+        <div id="flow"></div>
       </div>
       <div class="panel">
         <h3>大周期背景 <span class="muted small">（日线 / 4h，仅参考）</span></h3>
@@ -109,6 +113,7 @@
           <label><input type="checkbox" data-ev="tp1" /> 到达 TP1</label>
           <label><input type="checkbox" data-ev="close" /> 单子结束</label>
           <label><input type="checkbox" data-ev="exit" /> 趋势转弱</label>
+          <label><input type="checkbox" data-ev="level" /> 强价位被拒（涨不动/跌不动）</label>
           <label><input type="checkbox" data-ev="health" /> 启动 / 断线 / 睡眠</label>
         </div>
       </div>

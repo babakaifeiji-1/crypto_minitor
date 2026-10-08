@@ -118,5 +118,37 @@ const Levels = (() => {
     return out.map((c) => ({ price: c.sum / c.touches, touches: c.touches, lo: c.lo, hi: c.hi }));
   }
 
-  return { prepare, at, nearest, daily };
+  // 判定"碰到价位"用的窄区间：画线位置上下 0.4 ATR（聚类区可能很宽，不能直接用）
+  const zone = (L, atr) => ({ lo: Math.max(L.lo, L.price - 0.4 * atr), hi: Math.min(L.hi, L.price + 0.4 * atr) });
+
+  // 价位在第 i 根K线收盘时的测试状态：最近 6 根里有几根碰到过
+  // 回测（16 个品种 90 天）：★★★ 首次测试时 3 小时内被突破约 26%，之前磨过的约 40%
+  function testState(L0, k, i, atr) {
+    const L = { ...L0, ...zone(L0, atr) };
+    const isRes = L.price > k[i].close;
+    const edge = isRes ? L.lo - 0.1 * atr : L.hi + 0.1 * atr;
+    let tests = 0;
+    for (let m = Math.max(0, i - 5); m <= i; m++) if (isRes ? k[m].high >= edge : k[m].low <= edge) tests++;
+    return { isRes, tests };
+  }
+
+  // 第 i 根K线是否在强价位（★★★）出现"拒绝"：触及价位区、影线 ≥ 50%、收盘收回区内
+  // 回测：★★★ 首次测试 + 长影线收回，之后 3 小时内被突破的只有约 10%（随机价位同样形态约 19%）
+  function rejection(lv, k, i, atr) {
+    const b = k[i], pc = k[i - 1].close, rng = b.high - b.low || 1e-9;
+    for (const L0 of lv) {
+      if (L0.strength < 5) continue;
+      const L = { ...L0, ...zone(L0, atr) };
+      let side = 0;
+      if (L.price > pc && b.high >= L.lo - 0.1 * atr && b.close < L.lo && (b.high - Math.max(b.open, b.close)) / rng >= 0.5) side = 1;
+      else if (L.price < pc && b.low <= L.hi + 0.1 * atr && b.close > L.hi && (Math.min(b.open, b.close) - b.low) / rng >= 0.5) side = -1;
+      if (!side) continue;
+      let prior = 0;
+      for (let m = Math.max(0, i - 6); m < i; m++) if (side > 0 ? k[m].high >= L.lo - 0.1 * atr : k[m].low <= L.hi + 0.1 * atr) prior++;
+      return { level: L0, isRes: side > 0, first: prior === 0, time: b.time, i };
+    }
+    return null;
+  }
+
+  return { prepare, at, nearest, daily, testState, rejection };
 })();

@@ -19,6 +19,9 @@
   };
   const MARKET_NAMES = { crypto: "加密货币", us: "美股", kr: "韩股", hk: "港股", other: "其他" };
   const TZ = -new Date().getTimezoneOffset() * 60; // 图表显示本地时间
+  // 加密货币：信号K线主动成交偏向 ≥ 0.2（主动买入占成交量 ≥ 60%，空单反之）视为"过热追单"
+  // 6 个月 6 个币回测：这类信号每笔 -0.15R，其余 -0.02R，前后两半和 5/6 个币结论一致
+  const HOT_FLOW = 0.2;
 
   const store = {
     load(key, def) { try { const v = JSON.parse(localStorage.getItem("tm_" + key)); return v ?? def; } catch { return def; } },
@@ -95,7 +98,7 @@
   }
   async function fetchKlines(sym, interval, limit) {
     const arr = await fetchJson(`/fapi/v1/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
-    return arr.map((x) => ({ time: x[0] / 1000, open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5] }));
+    return arr.map((x) => ({ time: x[0] / 1000, open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5], takerBuy: +x[9] }));
   }
 
   // 合约类型（加密 / 美股 / 韩股…），以及美股成交量排行
@@ -146,8 +149,22 @@
       sg.h4 = b ? (b.st === sg.side ? "同向" : "逆向") : null;
       const hist = d.res.ind.macd.hist;
       sg.mt = (hist[sg.i] - hist[sg.i - 1]) * sg.side > 0 ? "是" : "否"; // MACD 柱是否朝信号方向拐头
+      const bar = d.ltf[sg.i];
+      sg.flow = bar?.volume ? ((2 * bar.takerBuy) / bar.volume - 1) * sg.side : null; // >0 表示主动成交和信号同方向
+      sg.hot = marketOf(sym) === "crypto" && sg.flow >= HOT_FLOW;
     }
     recordJournal(sym, d.res.signals);
+    // 最近 300 根已收盘K线里的强价位拒绝
+    {
+      const k = d.ltf, ind = d.res.ind;
+      let last = k.length - 1;
+      if (k[last].time + LTF_SEC > Date.now() / 1000) last--;
+      d.rejections = [];
+      for (let i = Math.max(61, last - 300); i <= last; i++) {
+        const ev = Levels.rejection(d.res.levelsAt(i - 1), k, i, ind.atr[i - 1]);
+        if (ev) d.rejections.push(ev);
+      }
+    }
     d.live = Strategy.liveState(d.res, d.ltf);
     d.exit = Strategy.exitWarning(d.res, d.ltf);
     const last = d.res.signals[d.res.signals.length - 1];
@@ -164,7 +181,7 @@
       if (sg.r == null || !sg.d1 || !sg.h4) continue;
       const key = `${sym}|${sg.time}`;
       if (journal[key]) continue;
-      journal[key] = { sym, t: sg.time, side: sg.side, r: +sg.r.toFixed(3), d1: sg.d1, h4: sg.h4, mt: sg.mt, tg: sg.trigger };
+      journal[key] = { sym, t: sg.time, side: sg.side, r: +sg.r.toFixed(3), d1: sg.d1, h4: sg.h4, mt: sg.mt, tg: sg.trigger, hot: sg.hot ? 1 : 0, crypto: marketOf(sym) === "crypto" ? 1 : 0 };
       journalDirty = true;
     }
   }
@@ -175,6 +192,43 @@
     store.save("journal", journal);
     journalDirty = false;
   }, 10000);
+
+  // ---------------- 合约资金面（加密货币）----------------
+  // 持仓量：5 分钟粒度近 4 小时；资金费率：当前预测值和下次结算时间
+  async function loadFlow(sym) {
+    const d = state.data[sym];
+    if (!d || marketOf(sym) !== "crypto") return;
+    try {
+      const [oi, pi] = await Promise.all([
+        fetchJson(`/futures/data/openInterestHist?symbol=${sym}&period=5m&limit=49`),
+        fetchJson(`/fapi/v1/premiumIndex?symbol=${sym}`),
+      ]);
+      d.flow = {
+        oi: oi.map((x) => ({ t: x.timestamp / 1000, v: +x.sumOpenInterestValue })),
+        funding: +pi.lastFundingRate, nextFunding: pi.nextFundingTime / 1000, at: Date.now(),
+      };
+    } catch (e) {
+      console.warn("资金面数据加载失败", sym, e);
+    }
+  }
+  function oiChange(d, sec) {
+    const a = d.flow?.oi;
+    if (!a?.length) return null;
+    const now = a[a.length - 1], then = [...a].reverse().find((x) => x.t <= now.t - sec);
+    return then ? (now.v / then.v - 1) * 100 : null;
+  }
+  const pctTxt = (v, digits = 2) => (v == null || isNaN(v) ? "-" : `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%`);
+  // 信号推送用的一行资金面摘要
+  function flowSummary(sym, s) {
+    const d = state.data[sym], parts = [];
+    if (s.flow != null) parts.push(`主动${s.side > 0 ? "买" : "卖"}占比 ${(((s.flow + 1) / 2) * 100).toFixed(0)}%${s.hot ? "（过热）" : ""}`);
+    const o1 = oiChange(d, 3600);
+    if (o1 != null) parts.push(`持仓1h ${pctTxt(o1)}`);
+    if (d.flow) parts.push(`资金费率 ${(d.flow.funding * 100).toFixed(4)}%`);
+    let txt = parts.length ? "资金面：" + parts.join(" · ") : "";
+    if (s.hot) txt += "<br><b>⚠️ 信号K线主动成交过于集中，回测这类信号胜率偏低，建议减半仓或放弃</b>";
+    return txt;
+  }
 
   function upsertCandle(arr, c) {
     const last = arr[arr.length - 1];
@@ -191,6 +245,7 @@
       // 首次加载：历史信号不提醒，只记录状态
       sigs.forEach((s) => d.seen.set(s.time, { result: s.result, weak: true }));
       if (d.exit) d.exitAlerted.add(d.exit.time);
+      d.rejSeen = new Set((d.rejections ?? []).map((e) => e.time));
       d.initialized = true;
       return;
     }
@@ -203,10 +258,11 @@
         if (age > 2 * LTF_SEC) continue; // 太旧的（如参数调整后新出现的历史信号）不提醒
         const sess = sessionOf(sym);
         const ctxTxt = [s.d1 && `日线${s.d1}`, s.h4 && `4h${s.h4}`].filter(Boolean).join(" · ");
+        const flowTxt = marketOf(sym) === "crypto" ? flowSummary(sym, s) : "";
         notify({
           kind: sideCls(s.side), event: "signal", sym,
           title: `${s.side > 0 ? "🟢" : "🔴"} ${nameOf(sym)} ${sideTxt(s.side)}信号`,
-          body: `${s.trigger} · ${s.score}分${sess ? " · " + sess.txt : ""}${ctxTxt ? "<br>大周期：" + ctxTxt : ""}<br>
+          body: `${s.trigger} · ${s.score}分${sess ? " · " + sess.txt : ""}${ctxTxt ? "<br>大周期：" + ctxTxt : ""}${flowTxt ? "<br>" + flowTxt : ""}<br>
             入场 <b>${fmtPrice(s.entry)}</b>，最多追到 ${fmtPrice(s.entry + s.side * p.maxChaseR * s.risk)}<br>
             止损 ${fmtPrice(s.sl)}（${fmtPct(s.sl, s.entry)}）· TP1 ${fmtPrice(s.tp1)}（${fmtPct(s.tp1, s.entry)}）<br>
             <span class="muted">${p.entryWindowBars * 15} 分钟内有效；价格回到 ${fmtPrice(s.entry)} ${s.side > 0 ? "下方" : "上方"}则放弃</span>`,
@@ -244,6 +300,21 @@
           });
         }
       }
+    }
+    d.rejSeen = d.rejSeen ?? new Set((d.rejections ?? []).map((e) => e.time));
+    for (const ev of d.rejections ?? []) {
+      if (d.rejSeen.has(ev.time)) continue;
+      d.rejSeen.add(ev.time);
+      if (nowSec - (ev.time + LTF_SEC) > 2 * LTF_SEC) continue;
+      const L = ev.level, what = ev.isRes ? "压力" : "支撑";
+      const last = sigs[sigs.length - 1], holding = last && last.r == null && last.side === (ev.isRes ? 1 : -1);
+      notify({
+        kind: "exit", event: "level", sym,
+        title: `🧱 ${nameOf(sym)} ${ev.isRes ? "涨不动" : "跌不动"}：强${what} ${fmtPrice(L.price)} 被拒`,
+        body: `${ev.first ? "首次测试" : "反复测试后"}，${ev.isRes ? "长上影" : "长下影"}收回${what}区内。<br>
+          回测：这种形态之后 3 小时内被突破的概率约 ${ev.first ? "10%" : "20%"}（普通价位约 40%）${holding ? `<br><b>你的${sideTxt(last.side)}单正顶着这个${what}，可考虑先减仓或收紧止损</b>` : ""}`,
+        feed: `<b class="wait">🧱 强${what}被拒</b> ${fmtPrice(L.price)}${ev.first ? "（首次）" : ""}`,
+      });
     }
     const ex = d.exit;
     if (ex && !d.exitAlerted.has(ex.time) && ex.time + LTF_SEC <= nowSec) {
@@ -320,7 +391,7 @@
       if (!k) return;
       const d = state.data[k.s];
       if (!d) return;
-      const c = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v };
+      const c = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v, takerBuy: +k.V };
       lastMsgAt = Date.now();
       const arr = { [LTF]: d.ltf, [HTF]: d.htf, "4h": d.h4, "1d": d.d1 }[k.i];
       if (arr) upsertCandle(arr, c);
@@ -397,6 +468,7 @@
     const near = lv.filter((l) => Math.abs(l.price - price) <= 6 * atr);
     const above = near.filter((l) => l.price > price).sort((a, b) => a.price - b.price).slice(0, n);
     const below = near.filter((l) => l.price <= price).sort((a, b) => b.price - a.price).slice(0, n);
+    for (const l of [...above, ...below]) l.test = Levels.testState(l, k, i, atr).tests;
     return { above, below, price };
   }
 
@@ -448,6 +520,10 @@
       text: `${s.side > 0 ? "多" : "空"}${s.score}`,
     }));
     if (d.exit) markers.push({ time: T(d.exit.time), position: d.exit.side > 0 ? "aboveBar" : "belowBar", color: "#f5a623", shape: "circle", text: "弱" });
+    for (const ev of d.rejections ?? []) markers.push({
+      time: T(ev.time), position: ev.isRes ? "aboveBar" : "belowBar", color: "#f5a623",
+      shape: "square", size: ev.first ? 1 : 0.6, text: ev.first ? "🧱" : "",
+    });
     markers.sort((a, b) => a.time - b.time);
     candle.setMarkers(markers);
 
@@ -458,8 +534,16 @@
 
     // 支撑压力位
     const kl = keyLevels(d);
-    kl.above.forEach((l) => add(l.price, "rgba(239,83,80,.55)", `压力${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`, 1, l.strength >= 5 ? 2 : 1));
-    kl.below.forEach((l) => add(l.price, "rgba(38,166,154,.55)", `支撑${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`, 1, l.strength >= 5 ? 2 : 1));
+    // ★ 级回测和随机价位差不多，不画；★★★ 用粗实线强调
+    const drawLv = (l, isRes) => {
+      if (l.strength < 3) return;
+      const strong = l.strength >= 5;
+      const color = isRes ? (strong ? "rgba(239,83,80,.95)" : "rgba(239,83,80,.45)") : strong ? "rgba(38,166,154,.95)" : "rgba(38,166,154,.45)";
+      const name = `${strong ? "强" : ""}${isRes ? "压力" : "支撑"}${stars(l)}${l.tags.length ? " " + l.tags.join("/") : ""}`;
+      add(l.price, color, name, strong ? 0 : 1, strong ? 3 : 1);
+    };
+    kl.above.forEach((l) => drawLv(l, true));
+    kl.below.forEach((l) => drawLv(l, false));
 
     // 日线关键位（紫色，较粗）
     const pxNow = k[k.length - 1].close, atrNow = ind.atr[ind.atr.length - 1];
@@ -505,7 +589,7 @@
 
   function statusBadge(sig, st, compact) {
     const ui = STATUS_UI[st.code];
-    let txt = `${ui.icon} ${sideTxt(sig.side)} · ${st.label}`;
+    let txt = `${ui.icon} ${sideTxt(sig.side)} · ${st.label}${sig.hot && st.code === "go" ? " · 🔥过热" : ""}`;
     if (st.code === "go") txt += ` · 还剩${st.minLeft}分钟`;
     return `<div class="badge ${ui.cls}">${txt}</div>`;
   }
@@ -603,8 +687,42 @@
           <span class="long">剩余半仓</span><span>移动止损</span><span class="muted">${p.trailAtr}×ATR 跟踪</span>
         </div>
         ${ahead ? `<div class="muted small" style="margin-top:4px">${ahead}</div>` : ""}
+        ${last.hot ? `<div class="warn">🔥 过热追单：信号K线主动${last.side > 0 ? "买入" : "卖出"}占比 ${(((last.flow + 1) / 2) * 100).toFixed(0)}%，回测这类信号胜率偏低，建议减半仓或放弃</div>` : ""}
         ${d.exit && d.exit.i > last.i && st.code !== "done" ? `<div class="warn">● 趋势转弱：${d.exit.reason}（${fmtTime(d.exit.time)}）</div>` : ""}
       </div>`);
+    }
+
+    // 合约资金面（加密货币）
+    if (marketOf(sym) === "crypto") {
+      $("flowPanel").style.display = "";
+      const k = d.ltf, cur = k[k.length - 1];
+      const ratio = (n) => { let b = 0, v = 0; for (let j = Math.max(0, k.length - n); j < k.length; j++) { b += k[j].takerBuy || 0; v += k[j].volume; } return v ? (b / v) * 100 : null; };
+      const r1 = ratio(1), r4 = ratio(4), r16 = ratio(16);
+      const rCls = (r) => (r == null ? "" : r >= 60 ? "long" : r <= 40 ? "short" : "");
+      const fl = d.flow, o1 = oiChange(d, 3600), o4 = oiChange(d, 4 * 3600);
+      const pxChg = (n) => (k.length > n ? ((cur.close / k[k.length - 1 - n].close - 1) * 100) : null);
+      const p1 = pxChg(4);
+      let read = "";
+      if (o1 != null && p1 != null) {
+        if (p1 > 0.2 && o1 > 0.3) read = "价格涨 + 持仓增：新多头进场推动";
+        else if (p1 > 0.2 && o1 < -0.3) read = "价格涨 + 持仓减：空头平仓推动（轧空），持续性通常较弱";
+        else if (p1 < -0.2 && o1 > 0.3) read = "价格跌 + 持仓增：新空头进场推动";
+        else if (p1 < -0.2 && o1 < -0.3) read = "价格跌 + 持仓减：多头止损/平仓推动";
+        else read = "价格和持仓变化都不大";
+      }
+      const fundMin = fl ? Math.max(0, Math.round((fl.nextFunding - Date.now() / 1000) / 60)) : null;
+      const fundRate = fl ? fl.funding * 100 : null;
+      setHtml("flow", `<div class="ctx-grid flow-grid">
+          <span class="muted">主动买入占比</span><span class="muted">当前K线</span><span class="muted">近1h</span><span class="muted">近4h</span>
+          <span></span><span class="num ${rCls(r1)}">${r1?.toFixed(0) ?? "-"}%</span><span class="num ${rCls(r4)}">${r4?.toFixed(0) ?? "-"}%</span><span class="num ${rCls(r16)}">${r16?.toFixed(0) ?? "-"}%</span>
+          <span class="muted">持仓量变化</span><span></span><span class="num">${pctTxt(o1)}</span><span class="num">${pctTxt(o4)}</span>
+        </div>
+        ${read ? `<div class="phase">${read}</div>` : ""}
+        <div class="tf-line" style="grid-template-columns:1fr 1fr"><span>资金费率 <b class="num ${fundRate > 0.03 ? "long" : fundRate < -0.01 ? "short" : ""}">${fundRate == null ? "-" : fundRate.toFixed(4) + "%"}</b></span>
+          <span class="muted">${fundMin == null ? "" : `距结算 ${Math.floor(fundMin / 60)}小时${fundMin % 60}分`}</span></div>
+        <div class="muted small" style="margin-top:4px">主动买入占比 ≥60%（做空时 ≤40%）的信号K线会标「过热」：6 个月回测里这类信号每笔 -0.15R，明显差于其他信号。持仓量和资金费率只有 30 天历史可查，暂时仅供参考。</div>`);
+    } else {
+      $("flowPanel").style.display = "none";
     }
 
     // 大周期背景
@@ -627,12 +745,17 @@
 
     // 关键价位
     const kl = keyLevels(d, 3);
-    const lvRow = (l, cls, label) => `<div class="lv-row"><span class="${cls}">${label} ${stars(l)}</span><span class="num">${fmtPrice(l.price)}</span><span class="muted num">${fmtPct(l.price, kl.price)}</span><span class="muted small">${l.tags.join("/") || l.touches + "次触及"}</span></div>`;
+    const testTxt = (l) => (l.test === 0 ? "" : l.test === 1 ? "正在测试" : `已磨 ${l.test} 根`);
+    const lvRow = (l, cls, label) => `<div class="lv-row ${l.strength >= 5 ? "lv-strong" : l.strength < 3 ? "lv-weak" : ""}"><span class="${cls}">${l.strength >= 5 ? "强" : ""}${label} ${stars(l)}</span><span class="num">${fmtPrice(l.price)}</span><span class="muted num">${fmtPct(l.price, kl.price)}</span><span class="muted small">${[l.tags.join("/"), testTxt(l)].filter(Boolean).join(" · ")}</span></div>`;
+    const lastRej = (d.rejections ?? []).slice(-1)[0];
+    const rejTxt = lastRej && d.ltf.length - 1 - lastRej.i <= 8
+      ? `<div class="warn" style="background:#3a2c10;color:#f5c542">🧱 ${fmtTime(lastRej.time)} 在强${lastRej.isRes ? "压力" : "支撑"} ${fmtPrice(lastRej.level.price)} 被拒${lastRej.first ? "（首次测试）" : ""}——${lastRej.isRes ? "涨不动" : "跌不动"}</div>` : "";
     setHtml("keyLevels",
       [...kl.above].reverse().map((l) => lvRow(l, "short", "压力")).join("") +
       `<div class="lv-row lv-now"><span>现价</span><span class="num">${fmtPrice(kl.price)}</span><span></span><span></span></div>` +
       kl.below.map((l) => lvRow(l, "long", "支撑")).join("") +
-      `<div class="muted small" style="margin-top:4px">由 15m / 1h 摆动高低点和昨日高低点聚类而来，★ 越多被测试次数越多。止损会放在支撑/压力区外侧。</div>`);
+      rejTxt +
+      `<div class="muted small" style="margin-top:4px">回测（16 个品种 90 天，碰到后 3 小时内被突破的概率）：随机价位约 39%，★ 级约 48%（不比随机好，图上不画），<b>★★★ 约 33%，第一次碰到约 26%</b>，第一次碰到且长影线收回（🧱）约 10%。之前已经磨过的约 40%；K线一旦收盘越过，价位基本失效。</div>`);
 
     // 实时共振
     const col = (side, sc) => `<div class="score-col"><div class="head ${sideCls(side)}"><span>${sideTxt(side)}</span><span class="num">${sc.score}/100</span></div>
@@ -667,6 +790,8 @@
         <span>4h 逆向</span>${grp((x) => x.h4 === "逆向")}
         <span>MACD柱已拐头</span>${grp((x) => x.mt === "是")}
         <span>MACD柱未拐头</span>${grp((x) => x.mt === "否")}
+        <span>加密·过热信号</span>${grp((x) => x.crypto && x.hot === 1)}
+        <span>加密·非过热</span>${grp((x) => x.crypto && x.hot === 0)}
         <span>回踩确认</span>${grp((x) => x.tg === "回踩确认")}
         <span>放量突破/跌破</span>${grp((x) => x.tg && x.tg !== "回踩确认")}
         <span>全部</span>${grp(() => true)}
@@ -830,6 +955,9 @@
     })));
     renderAll();
     connectWs();
+    const refreshFlow = () => Promise.allSettled(state.symbols.map(loadFlow));
+    refreshFlow();
+    setInterval(refreshFlow, 60000);
     Push.send("health", "✅ 盯盘助手已启动", `正在监控 ${state.symbols.length} 个品种：${state.symbols.map(short).join("、")}`, null);
     // 每秒刷新：实时价格、信号状态
     const isMobile = matchMedia("(max-width: 900px)").matches;
