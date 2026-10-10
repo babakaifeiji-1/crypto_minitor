@@ -40,6 +40,7 @@
     return saved;
   }
 
+  const sizing = store.load("sizing", { risk: 10 }); // 每笔愿意亏多少 USDT
   const state = {
     symbols: initialSymbols(),
     params: { ...Strategy.DEFAULTS, ...store.load("params", {}) },
@@ -66,6 +67,20 @@
   const short = (sym) => sym.replace(/USDT$/, "");
   const nameOf = (sym) => `${short(sym)}${CN_NAMES[sym] ? " " + CN_NAMES[sym] : ""}`;
   const marketOf = (sym) => state.market[sym] ?? (sym === "BTCUSDT" || sym === "ETHUSDT" ? "crypto" : "us");
+  // 按固定亏损额算下单量：数量 = 风险金额 / 止损距离
+  function sizeFor(sig) {
+    if (!(sizing.risk > 0)) return null;
+    const dist = Math.abs(sig.entry - sig.sl);
+    if (!dist) return null;
+    const qty = sizing.risk / dist, notional = qty * sig.entry;
+    const fee = notional * (state.params.feePct / 100);
+    return { qty, notional, fee, lev: Math.max(1, Math.ceil(notional / (sizing.risk * 20))) };
+  }
+  const fmtQty = (q, px) => (q * px >= 1 && q >= 100 ? q.toFixed(0) : q >= 1 ? q.toFixed(3) : q.toPrecision(3));
+  const sizeTxt = (sig) => {
+    const z = sizeFor(sig);
+    return z ? `亏 ${sizing.risk}U 的仓位：<b>${fmtQty(z.qty, sig.entry)}</b> 个（约 ${z.notional.toFixed(0)}U）` : "";
+  };
   const paramsFor = (sym) => ({ ...state.params, market: marketOf(sym) });
 
   // ---------------- 交易时段 ----------------
@@ -194,28 +209,66 @@
   }, 10000);
 
   // ---------------- 合约资金面（加密货币）----------------
-  // 持仓量：5 分钟粒度近 4 小时；资金费率：当前预测值和下次结算时间
+  // 持仓量：实时接口每 10 秒一次（延迟约 5 秒），4 小时以上的变化用 5 分钟统计补齐；
+  // 资金费率每分钟刷新
   async function loadFlow(sym) {
     const d = state.data[sym];
     if (!d || marketOf(sym) !== "crypto") return;
     try {
       const [oi, pi] = await Promise.all([
-        fetchJson(`/futures/data/openInterestHist?symbol=${sym}&period=5m&limit=49`),
+        fetchJson(`/futures/data/openInterestHist?symbol=${sym}&period=5m&limit=60`),
         fetchJson(`/fapi/v1/premiumIndex?symbol=${sym}`),
       ]);
       d.flow = {
-        oi: oi.map((x) => ({ t: x.timestamp / 1000, v: +x.sumOpenInterestValue })),
-        funding: +pi.lastFundingRate, nextFunding: pi.nextFundingTime / 1000, at: Date.now(),
+        ...(d.flow ?? {}),
+        hist: oi.map((x) => ({ t: x.timestamp / 1000 + 300, v: +x.sumOpenInterestValue })), // 统计值在该 5 分钟结束时才有
+        funding: +pi.lastFundingRate, nextFunding: pi.nextFundingTime / 1000, mark: +pi.markPrice,
       };
+      d.flow.live = d.flow.live ?? [];
     } catch (e) {
       console.warn("资金面数据加载失败", sym, e);
     }
   }
+  async function loadLiveOi(sym) {
+    const d = state.data[sym];
+    if (!d?.flow || marketOf(sym) !== "crypto") return;
+    try {
+      const r = await fetchJson(`/fapi/v1/openInterest?symbol=${sym}`);
+      const px = d.ltf[d.ltf.length - 1]?.close ?? d.flow.mark;
+      const pt = { t: r.time / 1000, v: +r.openInterest * px, c: +r.openInterest };
+      const live = d.flow.live;
+      if (!live.length || pt.t > live[live.length - 1].t) live.push(pt);
+      while (live.length && live[0].t < pt.t - 3 * 3600) live.shift();
+      d.flow.liveAt = Date.now();
+      d.dirty = true;
+    } catch (e) { /* 偶发失败下一轮重试 */ }
+  }
+  // 合并后的持仓序列：5 分钟统计 + 实时点（用合约张数比较，避免价格波动干扰）
+  function oiSeries(d) {
+    const f = d.flow;
+    if (!f) return [];
+    const live = f.live ?? [];
+    const firstLive = live.length ? live[0].t : Infinity;
+    const lastPx = d.ltf[d.ltf.length - 1].close;
+    return [...(f.hist ?? []).filter((x) => x.t < firstLive).map((x) => ({ t: x.t, c: x.v / (d.ltf.find((b) => b.time + LTF_SEC > x.t)?.close ?? lastPx) })), ...live];
+  }
   function oiChange(d, sec) {
-    const a = d.flow?.oi;
-    if (!a?.length) return null;
-    const now = a[a.length - 1], then = [...a].reverse().find((x) => x.t <= now.t - sec);
-    return then ? (now.v / then.v - 1) * 100 : null;
+    const a = oiSeries(d);
+    if (a.length < 2) return null;
+    const now = a[a.length - 1];
+    let then = null;
+    for (let j = a.length - 1; j >= 0; j--) if (a[j].t <= now.t - sec) { then = a[j]; break; }
+    if (!then || now.t - then.t > sec + 600) return null;
+    return (now.c / then.c - 1) * 100;
+  }
+  function oiSpark(d) {
+    const a = oiSeries(d).filter((x) => x.t >= Date.now() / 1000 - 2 * 3600);
+    if (a.length < 3) return "";
+    const W = 300, Hh = 34, t0 = a[0].t, t1 = a[a.length - 1].t || t0 + 1;
+    const lo = Math.min(...a.map((x) => x.c)), hi = Math.max(...a.map((x) => x.c)), span = hi - lo || 1;
+    const pts = a.map((x) => `${(((x.t - t0) / (t1 - t0)) * W).toFixed(1)},${(Hh - 2 - ((x.c - lo) / span) * (Hh - 4)).toFixed(1)}`).join(" ");
+    const up = a[a.length - 1].c >= a[0].c;
+    return `<svg class="spark" viewBox="0 0 ${W} ${Hh}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${up ? "#26a69a" : "#ef5350"}" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
   }
   const pctTxt = (v, digits = 2) => (v == null || isNaN(v) ? "-" : `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%`);
   // 信号推送用的一行资金面摘要
@@ -264,6 +317,7 @@
           title: `${s.side > 0 ? "🟢" : "🔴"} ${nameOf(sym)} ${sideTxt(s.side)}信号`,
           body: `${s.trigger} · ${s.score}分${sess ? " · " + sess.txt : ""}${ctxTxt ? "<br>大周期：" + ctxTxt : ""}${flowTxt ? "<br>" + flowTxt : ""}<br>
             入场 <b>${fmtPrice(s.entry)}</b>，最多追到 ${fmtPrice(s.entry + s.side * p.maxChaseR * s.risk)}<br>
+            ${sizeTxt(s) ? sizeTxt(s) + "<br>" : ""}
             止损 ${fmtPrice(s.sl)}（${fmtPct(s.sl, s.entry)}）· TP1 ${fmtPrice(s.tp1)}（${fmtPct(s.tp1, s.entry)}）<br>
             <span class="muted">${p.entryWindowBars * 15} 分钟内有效；价格回到 ${fmtPrice(s.entry)} ${s.side > 0 ? "下方" : "上方"}则放弃</span>`,
           feed: `<b class="${sideCls(s.side)}">${sideTxt(s.side)}</b> ${s.trigger} ${s.score}分 @ ${fmtPrice(s.entry)}`,
@@ -638,6 +692,7 @@
   const htmlCache = {};
   function setHtml(id, html) {
     if (htmlCache[id] === html) return;
+    if (document.activeElement?.closest?.(`#${id}`) && document.activeElement.tagName === "INPUT") return; // 正在输入时不重绘
     htmlCache[id] = html;
     $(id).innerHTML = html;
   }
@@ -686,6 +741,14 @@
           <span class="long">TP1 (1R)</span><span>${fmtPrice(last.tp1)}</span><span class="muted">${fmtPct(last.tp1, last.entry)} · 平一半</span>
           <span class="long">剩余半仓</span><span>移动止损</span><span class="muted">${p.trailAtr}×ATR 跟踪</span>
         </div>
+        ${(() => {
+          const z = sizeFor(last);
+          if (!z || st.code === "done" || st.code === "expired") return "";
+          return `<div class="size-box">每笔亏 <input id="riskInput" type="number" min="1" step="1" value="${sizing.risk}" />U 的仓位：
+            <b class="num">${fmtQty(z.qty, last.entry)}</b> 个 · 约 <b class="num">${z.notional.toFixed(0)}</b>U · 手续费约 ${z.fee.toFixed(2)}U
+            <div class="muted small">按信号价到止损 ${fmtPct(last.sl, last.entry)} 计算；杠杆只影响保证金，${z.lev}x 时约需 ${(z.notional / z.lev).toFixed(0)}U</div></div>`;
+        })()}
+        ${st.code !== "done" && st.code !== "expired" ? `<button class="btn copy-btn" data-copy="${sideTxt(last.side)} ${short(sym)} 入场 ${fmtPrice(last.entry)} 止损 ${fmtPrice(last.sl)} TP1 ${fmtPrice(last.tp1)}${sizeFor(last) ? " 数量 " + fmtQty(sizeFor(last).qty, last.entry) : ""}">📋 复制下单参数</button>` : ""}
         ${ahead ? `<div class="muted small" style="margin-top:4px">${ahead}</div>` : ""}
         ${last.hot ? `<div class="warn">🔥 过热追单：信号K线主动${last.side > 0 ? "买入" : "卖出"}占比 ${(((last.flow + 1) / 2) * 100).toFixed(0)}%，回测这类信号胜率偏低，建议减半仓或放弃</div>` : ""}
         ${d.exit && d.exit.i > last.i && st.code !== "done" ? `<div class="warn">● 趋势转弱：${d.exit.reason}（${fmtTime(d.exit.time)}）</div>` : ""}
@@ -699,7 +762,8 @@
       const ratio = (n) => { let b = 0, v = 0; for (let j = Math.max(0, k.length - n); j < k.length; j++) { b += k[j].takerBuy || 0; v += k[j].volume; } return v ? (b / v) * 100 : null; };
       const r1 = ratio(1), r4 = ratio(4), r16 = ratio(16);
       const rCls = (r) => (r == null ? "" : r >= 60 ? "long" : r <= 40 ? "short" : "");
-      const fl = d.flow, o1 = oiChange(d, 3600), o4 = oiChange(d, 4 * 3600);
+      const fl = d.flow, o5 = oiChange(d, 300), o15 = oiChange(d, 900), o1 = oiChange(d, 3600), o4 = oiChange(d, 4 * 3600);
+      const liveAge = fl?.liveAt ? Math.round((Date.now() - fl.liveAt) / 1000) : null;
       const pxChg = (n) => (k.length > n ? ((cur.close / k[k.length - 1 - n].close - 1) * 100) : null);
       const p1 = pxChg(4);
       let read = "";
@@ -715,12 +779,16 @@
       setHtml("flow", `<div class="ctx-grid flow-grid">
           <span class="muted">主动买入占比</span><span class="muted">当前K线</span><span class="muted">近1h</span><span class="muted">近4h</span>
           <span></span><span class="num ${rCls(r1)}">${r1?.toFixed(0) ?? "-"}%</span><span class="num ${rCls(r4)}">${r4?.toFixed(0) ?? "-"}%</span><span class="num ${rCls(r16)}">${r16?.toFixed(0) ?? "-"}%</span>
-          <span class="muted">持仓量变化</span><span></span><span class="num">${pctTxt(o1)}</span><span class="num">${pctTxt(o4)}</span>
         </div>
+        <div class="ctx-grid flow-grid" style="margin-top:6px">
+          <span class="muted">持仓量变化</span><span class="muted">5分钟</span><span class="muted">15分钟</span><span class="muted">1小时</span>
+          <span class="muted small">${liveAge == null ? "加载中" : liveAge <= 20 ? `<span class="long">● 实时</span> ${liveAge}秒前` : `<span class="wait">● ${liveAge}秒前</span>`}</span><span class="num">${pctTxt(o5)}</span><span class="num">${pctTxt(o15)}</span><span class="num">${pctTxt(o1)}</span>
+        </div>
+        ${oiSpark(d)}<div class="muted small" style="display:flex;justify-content:space-between"><span>持仓量 近 2 小时</span><span>4h ${pctTxt(o4)}</span></div>
         ${read ? `<div class="phase">${read}</div>` : ""}
         <div class="tf-line" style="grid-template-columns:1fr 1fr"><span>资金费率 <b class="num ${fundRate > 0.03 ? "long" : fundRate < -0.01 ? "short" : ""}">${fundRate == null ? "-" : fundRate.toFixed(4) + "%"}</b></span>
           <span class="muted">${fundMin == null ? "" : `距结算 ${Math.floor(fundMin / 60)}小时${fundMin % 60}分`}</span></div>
-        <div class="muted small" style="margin-top:4px">主动买入占比 ≥60%（做空时 ≤40%）的信号K线会标「过热」：6 个月回测里这类信号每笔 -0.15R，明显差于其他信号。持仓量和资金费率只有 30 天历史可查，暂时仅供参考。</div>`);
+        <div class="muted small" style="margin-top:4px">主动买入占比 ≥60%（做空时 ≤40%）的信号K线会标「过热」：6 个月回测里这类信号每笔 -0.15R，明显差于其他信号。持仓量每 10 秒更新；它和价格的组合目前没有找到稳定规律（见 README），仅供参考。</div>`);
     } else {
       $("flowPanel").style.display = "none";
     }
@@ -862,6 +930,18 @@
     };
 
     bindPushUi();
+    // 信号框里的仓位输入和复制按钮（内容每秒重绘，用事件委托）
+    $("lastSignal").addEventListener("change", (e) => {
+      if (e.target.id !== "riskInput") return;
+      const v = parseFloat(e.target.value);
+      if (v > 0) { sizing.risk = v; store.save("sizing", sizing); htmlCache.lastSignal = null; renderSide(); }
+    });
+    $("lastSignal").addEventListener("click", async (e) => {
+      const b = e.target.closest(".copy-btn");
+      if (!b) return;
+      try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "✅ 已复制"; }
+      catch { prompt("复制下面的内容", b.dataset.copy); }
+    });
     $("menuBtn").onclick = () => document.querySelector(".controls").classList.toggle("open");
 
     $("addForm").onsubmit = async (e) => {
@@ -956,8 +1036,15 @@
     renderAll();
     connectWs();
     const refreshFlow = () => Promise.allSettled(state.symbols.map(loadFlow));
-    refreshFlow();
+    await refreshFlow();
     setInterval(refreshFlow, 60000);
+    // 实时持仓：当前查看的品种每 10 秒，其它加密品种每 30 秒
+    let liveTick = 0;
+    setInterval(() => {
+      liveTick++;
+      for (const s of state.symbols) if (s === state.active || liveTick % 3 === 0) loadLiveOi(s);
+    }, 10000);
+    state.symbols.forEach(loadLiveOi);
     Push.send("health", "✅ 盯盘助手已启动", `正在监控 ${state.symbols.length} 个品种：${state.symbols.map(short).join("、")}`, null);
     // 每秒刷新：实时价格、信号状态
     const isMobile = matchMedia("(max-width: 900px)").matches;

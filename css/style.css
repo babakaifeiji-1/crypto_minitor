@@ -183,3 +183,7 @@ code { background: var(--bg); padding: 0 4px; border-radius: 3px; }
 .lv-strong { font-weight: 700; }
 .lv-strong .num:first-of-type { text-decoration: underline; text-underline-offset: 3px; }
 .lv-weak { opacity: .55; }
+.spark { display: block; width: 100%; height: 34px; margin-top: 6px; background: var(--panel2); border-radius: 4px; }
+.size-box { margin-top: 8px; padding: 6px 8px; background: var(--bg); border-radius: 6px; font-size: 12px; line-height: 1.7; }
+.size-box input { width: 56px; background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 4px; padding: 1px 4px; font: inherit; }
+.copy-btn { margin-top: 8px; width: 100%; }
